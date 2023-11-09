@@ -1,11 +1,13 @@
-use lambda_http::{run, service_fn, Body, Error, IntoResponse, Request, Response};
-use serde_json::{json, Value};
-use serde_derive::{Deserialize, Serialize};
+use lambda_http::{lambda, IntoResponse, Request, RequestExt, Response};
+use aws_sdk_dynamodb::{Client as DynamoClient, Error as DynamoError, model::AttributeValue};
+use aws_config::meta::region::RegionProviderChain;
+use serde_json::json;
+use serde::{Deserialize, Serialize};
 use std::env;
-use hyper::{Client, Request as HyperRequest, Body as HyperBody, header};
+use hyper::{Client as HyperClient, Request as HyperRequest, Body as HyperBody, header};
 use hyper_tls::HttpsConnector;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::sync::Arc;
+use tokio;
 
 // Struct to fetch OpenAI API Response
 #[derive(Deserialize, Debug)]
@@ -33,13 +35,22 @@ struct OAIRequest {
     max_tokens: u16,
 }
 
-// Helper function to read preambles from file
-fn read_preambles_from_file() -> io::Result<Vec<String>> {
-    let file = File::open("preambles.txt")?;
-    let reader = BufReader::new(file);
-    reader.lines().collect()
-}
+// Helper function to read preambles from dynamodb
+async fn fetch_preamble_from_dynamodb(dynamo_client: &DynamoClient, character_id: &str) -> Result<String, DynamoError> {
+    let get_item_output = dynamo_client.get_item()
+        .table_name("Characters")
+        .key("CharacterID", AttributeValue::S(character_id.to_owned()))
+        .send()
+        .await?;
 
+    if let Some(item) = get_item_output.item {
+        if let Some(preamble) = item.get("Prompt").and_then(AttributeValue::as_s) {
+            return Ok(preamble.to_owned());
+        }
+    }
+
+    Err(DynamoError::Unhandled("No preamble found for the given CharacterID".into()))
+}
 async fn function_handler(event: Request) -> Result<impl IntoResponse, Error> {
     // Load environment variables
     dotenv::dotenv().ok();
@@ -50,6 +61,7 @@ async fn function_handler(event: Request) -> Result<impl IntoResponse, Error> {
     let https = HttpsConnector::new();
     let client = Client::builder().build::<_, HyperBody>(https);
 
+    // This will be deprecated April 2024
     let uri = "https://api.openai.com/v1/engines/text-davinci-003/completions";
 
     // Extract the user's text from the query string
@@ -58,10 +70,20 @@ async fn function_handler(event: Request) -> Result<impl IntoResponse, Error> {
         .first("text")
         .unwrap_or_default();
 
-    // Read preambles from file
-    let preambles = read_preambles_from_file().unwrap_or_else(|_| vec![]);
-    // Select a random preamble for simplicity, you can implement your own logic
-    let selected_preamble = preambles.get(0).cloned().unwrap_or_default();
+    // Extract the character ID from the query string
+    let character_id = event
+        .query_string_parameters()
+        .first("character_id")
+        .unwrap_or_default();
+
+    // Fetch preamble from DynamoDB
+    let selected_preamble = match fetch_preamble_from_dynamodb(dynamo_client, character_id).await {
+        Ok(preamble) => preamble,
+        Err(e) => {
+            eprintln!("DynamoDB error: {:?}", e);
+            return Err(Error::from("Failed to fetch preamble from DynamoDB"));
+        },
+    };
 
     let oai_request = OAIRequest {
         prompt: format!("{} {}", selected_preamble, user_text),
@@ -98,7 +120,27 @@ async fn function_handler(event: Request) -> Result<impl IntoResponse, Error> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
-    run(service_fn(function_handler)).await?;
+async fn main() -> Result<(), lambda_http::Error> {
+    // Set up the region provider chain to default to 'us-west-2' if no other region is found.
+    let region_provider = RegionProviderChain::default_provider().or_else("us-west-2");
+
+    // Load the AWS configuration using the region provider chain.
+    let shared_config = aws_config::from_env().region(region_provider).load().await;
+
+    // Create a DynamoDB client with the loaded configuration.
+    let dynamo_client = DynamoClient::new(&shared_config);
+
+    // Wrap the DynamoDB client in an Arc for sharing across invocations.
+    let dynamo_client = Arc::new(dynamo_client);
+
+    // Use the lambda! macro to run your function handler
+    lambda!(|event, _context| {
+        let client = Arc::clone(&dynamo_client);
+        async move {
+            function_handler(event, client).await
+        }
+    });
+
     Ok(())
+}
 }
